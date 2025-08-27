@@ -273,6 +273,6 @@ public class ProducerConsumerMessagesDemo {
         gcThread.interrupt();
         gcThread.join();
 
-        System.out.println("[Main] Demo finished.");
+        System.out.println("[Main] Demo finished8.");
     }
 }
