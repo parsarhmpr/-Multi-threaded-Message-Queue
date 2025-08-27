@@ -4,9 +4,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 class Message {
     public final int id;
     public final String content;
-    public final long deadline;
+    public final long deadline; // epoch millis
 
-    public static final Message POISON = new Message(-1, "POISON", -1L);
+    // Poison sentinel uses MAX so GC never removes it and it sits at the end of heap
+    public static final Message POISON = new Message(-1, "POISON", Long.MAX_VALUE);
 
     public Message(int id, String content, long deadline) {
         this.id = id;
@@ -17,7 +18,9 @@ class Message {
     @Override
     public String toString() {
         if (this == POISON) return "Message{POISON}";
-        return "Message{id=" + id + ", remain time=" + (deadline - System.currentTimeMillis()) + "}";
+        long remain = deadline - System.currentTimeMillis();
+        if (remain <= 0) return "Message{id=" + id + ", expired}";
+        return "Message{id=" + id + ", remain(ms)=" + remain + "}";
     }
 }
 
@@ -42,7 +45,7 @@ class PurgeResult {
 }
 
 class MessageQueue {
-    private final Queue<Message> queue = new LinkedList<>();
+    private final PriorityQueue<Message> heap = new PriorityQueue<>(Comparator.comparingLong(m -> m.deadline));
     private final int capacity;
     private final String name;
 
@@ -51,49 +54,83 @@ class MessageQueue {
         this.name = name;
     }
 
-
+    /**
+     * Put a message into the heap. Blocks if capacity reached.
+     * Returns size AFTER insertion (consistent for logging).
+     */
     public synchronized int put(Message msg) throws InterruptedException {
-        while (queue.size() == capacity) {
+        while (heap.size() == capacity) {
             wait();
         }
-        queue.add(msg);
+        heap.add(msg);
         notifyAll();
-        return queue.size();
+        return heap.size();
     }
 
-
+    /**
+     * Take the top (earliest deadline) message, discarding expired messages encountered at the top.
+     * Blocks if heap is empty (or only contains expired messages which are cleaned here).
+     * Returns MessageWithSize containing the removed message and size AFTER removal.
+     */
     public synchronized MessageWithSize takeAndSize() throws InterruptedException {
-        while (queue.isEmpty()) {
-            wait();
+        while (true) {
+            while (heap.isEmpty()) {
+                wait();
+            }
+
+            long now = System.currentTimeMillis();
+            Message top = heap.peek();
+
+            // If top is the POISON sentinel, deliver it (consumer will exit).
+            if (top == Message.POISON) {
+                Message polled = heap.poll();
+                notifyAll();
+                return new MessageWithSize(polled, heap.size());
+            }
+
+            // If top expired, remove it and continue (consumer won't get expired messages).
+            if (top.deadline < now) {
+                Message removed = heap.poll();
+                System.out.printf("[Queue %s] removed expired message by consumer-check: %s (now=%d)%n",
+                        name, removed, now);
+                notifyAll();
+                // loop to check the next top
+                continue;
+            }
+
+            // top is valid -> remove and return
+            Message msg = heap.poll();
+            notifyAll();
+            return new MessageWithSize(msg, heap.size());
         }
-        Message msg = queue.poll();
-        notifyAll();
-        return new MessageWithSize(msg, queue.size());
     }
 
-
+    /**
+     * Purge expired messages by repeatedly checking the top of heap.
+     * Does NOT remove the POISON sentinel.
+     */
     public synchronized PurgeResult purgeExpired(long now) {
         int removed = 0;
-        Iterator<Message> it = queue.iterator();
-        while (it.hasNext()) {
-            Message m = it.next();
-            if (m == Message.POISON) continue;
-            if (m.deadline > 0 && m.deadline < now) {
-                it.remove();
+        while (true) {
+            Message top = heap.peek();
+            if (top == null) break;
+            if (top == Message.POISON) break; // do not purge poison
+            if (top.deadline < now) {
+                Message rem = heap.poll();
                 removed++;
+            } else {
+                break; // top is not expired
             }
         }
-        if (removed > 0) {
-            notifyAll();
-        }
-        return new PurgeResult(removed, queue.size());
+        if (removed > 0) notifyAll();
+        return new PurgeResult(removed, heap.size());
     }
 
     public synchronized int size() {
-        return queue.size();
+        return heap.size();
     }
 
-    public synchronized String getName(){
+    public synchronized String getName() {
         return name;
     }
 }
@@ -123,7 +160,8 @@ class Producer implements Runnable {
                 Message msg = new Message(msgId, content, deadline);
 
                 int sizeAfterPut = queue.put(msg);
-                System.out.printf("[Producer-%d] produced %s to %s (queue size=%d)%n", producerId, msg, queue.getName(), sizeAfterPut);
+                System.out.printf("[Producer-%d] produced %s to %s (queue size=%d)%n",
+                        producerId, msg, queue.getName(), sizeAfterPut);
 
                 Thread.sleep(50 + rnd.nextInt(150));
             }
@@ -153,7 +191,7 @@ class Consumer implements Runnable {
                 int sizeAfterTake = result.queueSize;
 
                 // poison pill -> stop
-                if (msg == Message.POISON || msg.id == Message.POISON.id) {
+                if (msg == Message.POISON) {
                     System.out.printf("[Consumer-%d] received POISON and is exiting.%n", consumerId);
                     break;
                 }
@@ -195,8 +233,8 @@ class GarbageCollector implements Runnable {
                     MessageQueue q = queues.get(i);
                     PurgeResult r = q.purgeExpired(now);
                     if (r.removed > 0) {
-                        System.out.printf("[GC] purged %d expired messages from topic-%d (size after=%d)%n",
-                                r.removed, i + 1, r.sizeAfter);
+                        System.out.printf("[GC] purged %d expired messages from %s (size after=%d)%n",
+                                r.removed, q.getName(), r.sizeAfter);
                     }
                 }
                 Thread.sleep(intervalMs);
@@ -211,8 +249,8 @@ class GarbageCollector implements Runnable {
 public class ProducerConsumerMessagesDemo {
     public static void main(String[] args) throws InterruptedException {
         final int QUEUE_CAPACITY = 50;
-        final int NUM_PRODUCERS = 4;
-        final int NUM_CONSUMERS = 2;
+        final int NUM_PRODUCERS = 6;
+        final int NUM_CONSUMERS = 4;
         final int MESSAGES_PER_PRODUCER = 10;
         final long GC_INTERVAL_MS = 100L;
 
@@ -231,6 +269,7 @@ public class ProducerConsumerMessagesDemo {
         Thread gcThread = new Thread(gc, "GarbageCollector");
         gcThread.start();
 
+        // start consumers (split between two topics)
         for (int i = 0; i < NUM_CONSUMERS; i++) {
             Consumer c;
             if (i < NUM_CONSUMERS / 2) c = new Consumer(i + 1, queue1);
@@ -240,9 +279,9 @@ public class ProducerConsumerMessagesDemo {
             t.start();
         }
 
+        // start producers (split between two topics)
         for (int i = 0; i < NUM_PRODUCERS; i++) {
             Producer p;
-
             if (i < NUM_PRODUCERS / 2) p = new Producer(i + 1, queue1, MESSAGES_PER_PRODUCER, globalMessageId);
             else p = new Producer(i + 1, queue2, MESSAGES_PER_PRODUCER, globalMessageId);
             Thread t = new Thread(p, "Producer-" + (i + 1));
@@ -250,19 +289,21 @@ public class ProducerConsumerMessagesDemo {
             t.start();
         }
 
+        // wait for all producers to finish
         for (Thread p : producers) {
             p.join();
         }
         System.out.println("[Main] All producers finished. Sending poison pills to consumers...");
 
+        // send one poison pill per consumer for each topic
         for (int i = 0; i < NUM_CONSUMERS / 2; i++) {
             queue1.put(Message.POISON);
         }
-
         for (int i = 0; i < NUM_CONSUMERS / 2; i++) {
             queue2.put(Message.POISON);
         }
 
+        // wait for consumers to finish
         for (Thread c : consumers) {
             c.join();
         }
@@ -273,6 +314,6 @@ public class ProducerConsumerMessagesDemo {
         gcThread.interrupt();
         gcThread.join();
 
-        System.out.println("[Main] Demo finished8.");
+        System.out.println("[Main] Demo finished.");
     }
 }
