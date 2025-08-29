@@ -21,7 +21,6 @@ public class MessageQueue {
     public synchronized MessageWithSize takeAndLog(int consumerId) throws InterruptedException {
         while (true) {
             while (heap.isEmpty()) wait();
-            long now = System.currentTimeMillis();
             Message top = heap.peek();
             if (top == null) { wait(); continue; }
             if (top == Message.POISON) {
@@ -30,7 +29,7 @@ public class MessageQueue {
                 EventLogger.log(String.format("[Consumer %d] received POISON from %s (queue size = %d)", consumerId, name, heap.size()));
                 return new MessageWithSize(p, heap.size());
             }
-            now = System.currentTimeMillis();
+            long now = System.currentTimeMillis();
             if (top.deadline > 0 && top.deadline < now) {
                 Message removed = heap.poll();
                 int sizeAfter = heap.size();
@@ -59,7 +58,4 @@ public class MessageQueue {
         }
         notifyAll();
     }
-
-    public synchronized int size() { return heap.size(); }
-    public String getName() { return name; }
 }
