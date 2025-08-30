@@ -22,7 +22,6 @@ public class MessageQueue {
         while (true) {
             while (heap.isEmpty()) wait();
             Message top = heap.peek();
-            if (top == null) { wait(); continue; }
             if (top == Message.POISON) {
                 Message p = heap.poll();
                 notifyAll();

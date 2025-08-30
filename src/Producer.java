@@ -22,7 +22,7 @@ public class Producer implements Runnable {
         try {
             for (int i = 0; i < messagesToProduce; i++) {
                 int msgId = globalMessageId.incrementAndGet();
-                long INFINITY = 1000_000;
+                long INFINITY = 1_000_000;
                 long ttl = RETENTION_POLICY ? 100 + rnd.nextInt(700) : INFINITY;
                 long deadline = System.currentTimeMillis() + ttl;
                 Message msg = new Message(msgId, "FromP" + producerId + "-msg" + (i + 1), deadline);
